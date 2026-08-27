@@ -9,6 +9,7 @@ type Tx = {
   type: string;
   note: string;
   source: string;
+  externalId?: string;
 };
 type ImportedTx = {
   date: string;
@@ -112,47 +113,45 @@ export default function Home() {
   });
   const [budgetForm, setBudgetForm] = useState({ month: new Date().toISOString().slice(0, 7), name: "", category: "Rent", plannedAmount: "" });
   const fileRef = useRef<HTMLInputElement>(null);
-  async function refresh() {
-    const [d, b] = await Promise.all([(await fetch("/api/transactions")).json(), (await fetch("/api/budgets")).json()]);
-    setItems(d.transactions || []);
-    setBudgets(b.budgets || []);
+  function refresh() {
+    const transactions = JSON.parse(localStorage.getItem("counted-transactions") || "[]") as Tx[];
+    const savedBudgets = JSON.parse(localStorage.getItem("counted-budgets") || "[]") as Budget[];
+    setItems(transactions);
+    setBudgets(savedBudgets);
     setLoading(false);
   }
-  async function addBudget(e: React.FormEvent) {
-    e.preventDefault();
-    await fetch("/api/budgets", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...budgetForm, plannedAmount: Number(budgetForm.plannedAmount) }) });
-    setBudgetOpen(false); setBudgetForm({ ...budgetForm, name: "", plannedAmount: "" }); refresh();
+  function saveItems(transactions: Tx[]) {
+    localStorage.setItem("counted-transactions", JSON.stringify(transactions));
+    setItems(transactions);
   }
-  async function toggleBudget(id: number, isPaid: boolean) { await fetch("/api/budgets", { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ id, isPaid }) }); refresh(); }
-  async function removeBudget(id: number) { await fetch(`/api/budgets?id=${id}`, { method: "DELETE" }); refresh(); }
-  useEffect(() => {
-    refresh();
-  }, []);
-  async function add(e: React.FormEvent) {
+  function saveBudgets(nextBudgets: Budget[]) {
+    localStorage.setItem("counted-budgets", JSON.stringify(nextBudgets));
+    setBudgets(nextBudgets);
+  }
+  function addBudget(e: React.FormEvent) {
     e.preventDefault();
-    await fetch("/api/transactions", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        ...form,
-        amount: Number(form.amount),
-        source: "manual",
-      }),
-    });
+    saveBudgets([...budgets, { ...budgetForm, id: Date.now(), plannedAmount: Number(budgetForm.plannedAmount), isPaid: false }]);
+    setBudgetOpen(false); setBudgetForm({ ...budgetForm, name: "", plannedAmount: "" });
+  }
+  function toggleBudget(id: number, isPaid: boolean) { saveBudgets(budgets.map((x) => x.id === id ? { ...x, isPaid } : x)); }
+  function removeBudget(id: number) { saveBudgets(budgets.filter((x) => x.id !== id)); }
+  useEffect(() => {
+    const timer = window.setTimeout(refresh, 0);
+    return () => window.clearTimeout(timer);
+  }, []);
+  function add(e: React.FormEvent) {
+    e.preventDefault();
+    saveItems([{ ...form, id: Date.now(), amount: Number(form.amount), source: "manual" }, ...items]);
     setModal(false);
     setForm({ ...form, merchant: "", amount: "", note: "" });
-    refresh();
   }
-  async function remove(id: number) {
-    await fetch(`/api/transactions?id=${id}`, { method: "DELETE" });
-    refresh();
+  function remove(id: number) {
+    saveItems(items.filter((x) => x.id !== id));
   }
-  async function loadDemo() {
-    await fetch("/api/transactions", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        batch: DEMO.map((x) => ({
+  function loadDemo() {
+    const existing = new Set(items.map((x) => `${x.date}|${x.merchant}|${x.amount}`));
+    const sample = DEMO.map((x, index) => ({
+          id: Date.now() + index,
           date: x[0],
           merchant: x[1],
           amount: x[2],
@@ -160,11 +159,9 @@ export default function Home() {
           type: "Expense",
           note: "Demo from MoMo analysis",
           source: "demo",
-        })),
-      }),
-    });
+        } as Tx)).filter((x) => !existing.has(`${x.date}|${x.merchant}|${x.amount}`));
+    saveItems([...sample, ...items]);
     setStatus("Sample spending added");
-    refresh();
   }
   function parseCsv(text: string) {
     const lines = text.trim().split(/\r?\n/),
@@ -234,7 +231,7 @@ export default function Home() {
     for (let pageNo = 1; pageNo <= doc.numPages; pageNo++) {
       const page = await doc.getPage(pageNo),
         content = await page.getTextContent(),
-        items = (content.items as any[])
+        items = (content.items as Array<{ str?: string; transform: number[] }>)
           .filter((x) => x.str?.trim())
           .map((x) => ({
             text: String(x.str).trim(),
@@ -302,23 +299,10 @@ export default function Home() {
     return rows;
   }
   async function saveBatches(batch: ImportedTx[]) {
-    let saved = 0;
-    const batchSize = 10;
-    for (let i = 0; i < batch.length; i += batchSize) {
-      setStatus(
-        `Saving transactions ${i + 1}-${Math.min(i + batchSize, batch.length)} of ${batch.length}…`,
-      );
-      const r = await fetch("/api/transactions", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ batch: batch.slice(i, i + batchSize) }),
-      });
-      const d = await r.json();
-      if (!r.ok)
-        throw new Error(d.error || "Could not save extracted transactions");
-      saved += d.transactions?.length || 0;
-    }
-    return saved;
+    const keys = new Set(items.map((x) => x.externalId || `${x.date}|${x.merchant}|${x.amount}`));
+    const fresh = batch.filter((x) => !keys.has(x.externalId || `${x.date}|${x.merchant}|${x.amount}`));
+    saveItems([...fresh.map((x, index) => ({ ...x, id: Date.now() + index })), ...items]);
+    return fresh.length;
   }
   async function importFile(e: React.ChangeEvent<HTMLInputElement>) {
     const f = e.target.files?.[0];
@@ -337,7 +321,6 @@ export default function Home() {
         `${saved} new outgoing transactions imported; ${batch.length - saved} duplicates skipped`,
       );
       setImportOpen(false);
-      refresh();
     } catch (error) {
       setStatus(
         error instanceof Error
